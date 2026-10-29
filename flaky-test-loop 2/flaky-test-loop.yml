@@ -76,7 +76,7 @@ env:
   # The complete Flink CI:
   TEST: 'UnalignedCheckpointRescaleWithMixedExchangesITCase'
   # Test mode: the Maven module that contains the tests.
-  MODULE: 'flink-runtime'
+  MODULE: 'flink-tests'
   # Test mode: the most machines per commit.
   SHARDS: 5
   # How many times to run everything in this one workflow run (1 or more). GitHub runs at
