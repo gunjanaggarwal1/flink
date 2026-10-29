@@ -74,9 +74,9 @@ env:
   # Surefire -Dtest syntax: 'Class#method', 'Class#m1+m2', 'ClassA,ClassB', 'Blob*Test':
   # TEST: 'MyTest#testA+testB'
   # The complete Flink CI:
-  TEST: 'UnalignedCheckpointRescaleMixedComplexityFixedParallelismITCase'
+  TEST: 'UnalignedCheckpointRescaleWithMixedExchangesITCase'
   # Test mode: the Maven module that contains the tests.
-  MODULE: 'flink-tests'
+  MODULE: 'flink-runtime'
   # Test mode: the most machines per commit.
   SHARDS: 5
   # How many times to run everything in this one workflow run (1 or more). GitHub runs at
