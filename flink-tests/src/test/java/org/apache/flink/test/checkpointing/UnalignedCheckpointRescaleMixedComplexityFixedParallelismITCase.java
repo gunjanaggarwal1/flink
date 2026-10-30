@@ -90,12 +90,11 @@ class UnalignedCheckpointRescaleMixedComplexityFixedParallelismITCase {
      */
     private enum Scenario {
         /** Parallelisms observed to fail on the jdk17 CI run. */
-        JDK17(new DagParallelism(9, 7, 9, 6), new DagParallelism(1, 5, 2, 1))
-        /** Parallelisms observed to fail on the hadoop313 CI run. */
-//        HADOOP313(new DagParallelism(8, 5, 10, 6), new DagParallelism(2, 4, 4, 1)),
-        /** Same as JDK17, but Co-Map/"Map after forward" keep up with the load. Expected to pass. */
-//        SAFE_CONTROL(new DagParallelism(9, 7, 9, 6), new DagParallelism(1, 5, 10, 1)),
-        ;
+        JDK17(new DagParallelism(9, 7, 9, 6), new DagParallelism(1, 5, 2, 1));
+        // Parallelisms observed to fail on the hadoop313 CI run:
+        // HADOOP313(new DagParallelism(8, 5, 10, 6), new DagParallelism(2, 4, 4, 1)),
+        // Same as JDK17, but Co-Map/"Map after forward" keep up with the load. Expected to pass:
+        // SAFE_CONTROL(new DagParallelism(9, 7, 9, 6), new DagParallelism(1, 5, 10, 1)),
 
         private final DagParallelism initial;
         private final DagParallelism rescaled;
@@ -227,7 +226,9 @@ class UnalignedCheckpointRescaleMixedComplexityFixedParallelismITCase {
                         return super.splitNumberRange(from, to, MAX_SLOTS);
                     }
                 },
-                RateLimiterStrategy.perSecond(Integer.getInteger("source.rate", 5000)),
+                RateLimiterStrategy.perSecond(
+                        Integer.parseInt(
+                                System.getProperties().getProperty("source.rate", "5000"))),
                 Types.LONG);
     }
 
