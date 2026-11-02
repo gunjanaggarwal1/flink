@@ -18,9 +18,15 @@
 
 package org.apache.flink.test.checkpointing;
 
+import org.apache.flink.api.common.JobID;
 import org.apache.flink.api.common.JobStatus;
 import org.apache.flink.api.common.eventtime.WatermarkStrategy;
+import org.apache.flink.api.common.functions.OpenContext;
+import org.apache.flink.api.common.functions.RichMapFunction;
+import org.apache.flink.api.common.functions.RuntimeContext;
+import org.apache.flink.api.common.time.Deadline;
 import org.apache.flink.api.common.typeinfo.Types;
+import org.apache.flink.api.connector.source.SourceReaderContext;
 import org.apache.flink.api.connector.source.lib.NumberSequenceSource;
 import org.apache.flink.api.connector.source.util.ratelimit.RateLimiterStrategy;
 import org.apache.flink.api.java.functions.KeySelector;
@@ -30,23 +36,36 @@ import org.apache.flink.configuration.ExternalizedCheckpointRetention;
 import org.apache.flink.configuration.RestartStrategyOptions;
 import org.apache.flink.configuration.StateRecoveryOptions;
 import org.apache.flink.connector.datagen.source.DataGeneratorSource;
+import org.apache.flink.connector.datagen.source.GeneratorFunction;
 import org.apache.flink.core.execution.JobClient;
+import org.apache.flink.runtime.checkpoint.CheckpointStatsSnapshot;
+import org.apache.flink.runtime.checkpoint.CompletedCheckpointStats;
+import org.apache.flink.runtime.executiongraph.AccessExecutionGraph;
+import org.apache.flink.runtime.executiongraph.AccessExecutionJobVertex;
 import org.apache.flink.runtime.minicluster.MiniCluster;
 import org.apache.flink.runtime.testutils.CommonTestUtils;
 import org.apache.flink.runtime.testutils.MiniClusterResourceConfiguration;
 import org.apache.flink.streaming.api.datastream.DataStream;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
-import org.apache.flink.streaming.api.functions.co.CoMapFunction;
+import org.apache.flink.streaming.api.functions.co.RichCoMapFunction;
 import org.apache.flink.test.junit5.InjectMiniCluster;
 import org.apache.flink.test.junit5.MiniClusterExtension;
 import org.apache.flink.testutils.junit.extensions.parameterized.Parameter;
 import org.apache.flink.testutils.junit.extensions.parameterized.ParameterizedTestExtension;
 import org.apache.flink.testutils.junit.extensions.parameterized.Parameters;
 
+import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestTemplate;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.junit.jupiter.api.extension.RegisterExtension;
 import org.junit.jupiter.api.io.TempDir;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import oshi.SystemInfo;
+import oshi.hardware.CentralProcessor;
+import oshi.hardware.GlobalMemory;
+import oshi.hardware.HardwareAbstractionLayer;
+import oshi.hardware.VirtualMemory;
 
 import javax.annotation.Nullable;
 
@@ -55,6 +74,12 @@ import java.time.Duration;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
+import java.util.Map;
+import java.util.StringJoiner;
+import java.util.TreeMap;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicLong;
 
 import static org.apache.flink.configuration.RestartStrategyOptions.RestartStrategyType.NO_RESTART_STRATEGY;
 
@@ -71,6 +96,27 @@ class UnalignedCheckpointRescaleMixedComplexityFixedParallelismCIITCase {
     private static final int NUM_TASK_MANAGERS = 1;
     private static final int SLOTS_PER_TASK_MANAGER = 10;
     private static final int MAX_SLOTS = NUM_TASK_MANAGERS * SLOTS_PER_TASK_MANAGER;
+
+    /**
+     * Short enough that an expired checkpoint fails the job (no tolerable checkpoint failures, no
+     * restarts) well before the CI step timeout, so the per-subtask records still get logged.
+     */
+    private static final Duration CHECKPOINT_TIMEOUT = Duration.ofSeconds(60);
+
+    /** Upper bound for waiting on a checkpoint, in case the job neither checkpoints nor fails. */
+    private static final Duration CHECKPOINT_WAIT_TIMEOUT = CHECKPOINT_TIMEOUT.multipliedBy(2);
+
+    private static final Logger LOG =
+            LoggerFactory.getLogger(
+                    UnalignedCheckpointRescaleMixedComplexityFixedParallelismCIITCase.class);
+
+    /**
+     * Records processed by each subtask of the currently running job, keyed by "operator
+     * (index/parallelism)". The MiniCluster runs in the test JVM, so the operators can update it
+     * directly. It is reset whenever a new job is submitted.
+     */
+    private static final Map<String, RecordCounter> RECORDS_PER_SUBTASK =
+            new ConcurrentHashMap<>();
 
     @Parameter private Scenario scenario;
 
@@ -121,9 +167,9 @@ class UnalignedCheckpointRescaleMixedComplexityFixedParallelismCIITCase {
 
         CommonTestUtils.waitForJobStatus(jobClient1, Collections.singletonList(JobStatus.RUNNING));
         CommonTestUtils.waitForAllTaskRunning(miniCluster, jobClient1.getJobID(), false);
+        logParallelism("Job 1", jobClient1.getJobID(), miniCluster);
         String checkpointPath =
-                CommonTestUtils.waitForCheckpointWithInflightBuffers(
-                        jobClient1.getJobID(), miniCluster);
+                waitForCheckpointWithInflightBuffers("Job 1", jobClient1.getJobID(), miniCluster);
         CommonTestUtils.terminateJob(jobClient1);
 
         // Step 2: Restore the job with the rescaled parallelism
@@ -133,13 +179,41 @@ class UnalignedCheckpointRescaleMixedComplexityFixedParallelismCIITCase {
 
         CommonTestUtils.waitForJobStatus(jobClient2, Collections.singletonList(JobStatus.RUNNING));
         CommonTestUtils.waitForAllTaskRunning(miniCluster, jobClient2.getJobID(), false);
-        CommonTestUtils.waitForCheckpointWithInflightBuffers(jobClient2.getJobID(), miniCluster);
+        logParallelism("Job 2", jobClient2.getJobID(), miniCluster);
+        waitForCheckpointWithInflightBuffers("Job 2", jobClient2.getJobID(), miniCluster);
+        CommonTestUtils.terminateJob(jobClient2);
+    }
+
+    @Test
+    void testReproduceCheckpointDeadlock(@InjectMiniCluster MiniCluster miniCluster)
+            throws Exception {
+        // Phase 1: initial job with safe parallelism — checkpoint completes fine
+        JobClient jobClient1 =
+                createMixedComplexityDAG(getUnalignedCheckpointEnv(null), 9, 7, 9, 6);
+        CommonTestUtils.waitForJobStatus(jobClient1, Collections.singletonList(JobStatus.RUNNING));
+        CommonTestUtils.waitForAllTaskRunning(miniCluster, jobClient1.getJobID(), false);
+        logParallelism("Job 1", jobClient1.getJobID(), miniCluster);
+        String checkpointPath =
+                waitForCheckpointWithInflightBuffers("Job 1", jobClient1.getJobID(), miniCluster);
+        CommonTestUtils.terminateJob(jobClient1);
+
+        // Phase 2: rescaled job with coMapPar=2
+        // 10,000 rec/sec total into Co-Map, 2 subtasks → 5,000 rec/sec per subtask
+        // Map after forward: FORWARD (aligned checkpoint), sleep(1ms) = 1,000 rec/sec capacity
+        // 5x overload → aligned checkpoint barrier stuck in full buffers → checkpoint expires
+        JobClient jobClient2 =
+                createMixedComplexityDAG(getUnalignedCheckpointEnv(checkpointPath), 1, 5, 2, 1);
+        CommonTestUtils.waitForJobStatus(jobClient2, Collections.singletonList(JobStatus.RUNNING));
+        CommonTestUtils.waitForAllTaskRunning(miniCluster, jobClient2.getJobID(), false);
+        logParallelism("Job 2", jobClient2.getJobID(), miniCluster);
+        waitForCheckpointWithInflightBuffers("Job 2", jobClient2.getJobID(), miniCluster);
         CommonTestUtils.terminateJob(jobClient2);
     }
 
     private StreamExecutionEnvironment getUnalignedCheckpointEnv(@Nullable String recoveryPath) {
         Configuration conf = new Configuration();
         conf.set(CheckpointingOptions.CHECKPOINTING_INTERVAL, Duration.ofSeconds(1));
+        conf.set(CheckpointingOptions.CHECKPOINTING_TIMEOUT, CHECKPOINT_TIMEOUT);
         // Disable aligned timeout to ensure it works with unaligned checkpoint directly
         conf.set(CheckpointingOptions.ALIGNED_CHECKPOINT_TIMEOUT, Duration.ofSeconds(0));
         conf.set(RestartStrategyOptions.RESTART_STRATEGY, NO_RESTART_STRATEGY.getMainValue());
@@ -158,18 +232,39 @@ class UnalignedCheckpointRescaleMixedComplexityFixedParallelismCIITCase {
 
     private static JobClient createMixedComplexityDAG(
             StreamExecutionEnvironment env, DagParallelism parallelism) throws Exception {
+        return createMixedComplexityDAG(
+                env,
+                parallelism.source1,
+                parallelism.source2,
+                parallelism.coMap,
+                parallelism.mapAfterKeyBy);
+    }
+
+    private static JobClient createMixedComplexityDAG(
+            StreamExecutionEnvironment env,
+            int source1Par,
+            int source2Par,
+            int coMapPar,
+            int mapKeyByPar)
+            throws Exception {
         // Multi-input part
         DataStream<Long> sourceStream1 =
-                env.fromSource(createSource(), WatermarkStrategy.noWatermarks(), "Source 1")
-                        .setParallelism(parallelism.source1);
+                env.fromSource(
+                                createSource("Source 1"),
+                                WatermarkStrategy.noWatermarks(),
+                                "Source 1")
+                        .setParallelism(source1Par);
 
         DataStream<Long> sourceStream2 =
-                env.fromSource(createSource(), WatermarkStrategy.noWatermarks(), "Source 2")
-                        .setParallelism(parallelism.source2);
+                env.fromSource(
+                                createSource("Source 2"),
+                                WatermarkStrategy.noWatermarks(),
+                                "Source 2")
+                        .setParallelism(source2Par);
 
         // Keep the same parallelism to ensure the ForwardPartitioner will be used.
         DataStream<Long> forwardedStream =
-                sourceStream2.map(x -> x).setParallelism(parallelism.source2);
+                sourceStream2.map(new CountingMap("Map")).setParallelism(source2Par);
 
         DataStream<Long> multiInputMap =
                 sourceStream1
@@ -177,27 +272,160 @@ class UnalignedCheckpointRescaleMixedComplexityFixedParallelismCIITCase {
                         .connect(forwardedStream.rebalance())
                         .map(new PassThroughCoMap())
                         .name("Co-Map")
-                        .setParallelism(parallelism.coMap);
+                        .setParallelism(coMapPar);
 
         // Multi-output part
         multiInputMap
                 .keyBy((KeySelector<Long, Long>) value -> value)
-                .map(x -> x)
+                .map(new CountingMap("Map after keyBy"))
                 .name("Map after keyBy")
-                .setParallelism(parallelism.mapAfterKeyBy);
+                .setParallelism(mapKeyByPar);
 
         // Keep the same parallelism to ensure the ForwardPartitioner will be used.
         multiInputMap
-                .map(x -> x)
+                .map(new CountingMap("Map after forward"))
                 .name("Map after forward")
-                .setParallelism(parallelism.coMap);
+                .setParallelism(multiInputMap.getParallelism());
 
+        // The previous job has terminated by now, so its counts are no longer relevant.
+        RECORDS_PER_SUBTASK.clear();
         return env.executeAsync();
     }
 
-    private static DataGeneratorSource<Long> createSource() {
+    /**
+     * Waits until a checkpoint with in-flight buffers completes and returns its path. Unlike {@link
+     * CommonTestUtils#waitForCheckpointWithInflightBuffers}, the wait is bounded, and the records
+     * per subtask are logged if the job terminates first or the wait times out.
+     */
+    private static String waitForCheckpointWithInflightBuffers(
+            String jobLabel, JobID jobId, MiniCluster miniCluster) throws Exception {
+        final Deadline deadline = Deadline.fromNow(CHECKPOINT_WAIT_TIMEOUT);
+        while (true) {
+            final AccessExecutionGraph graph = miniCluster.getExecutionGraph(jobId).get();
+            final CheckpointStatsSnapshot stats = graph.getCheckpointStatsSnapshot();
+            final CompletedCheckpointStats latestCompleted =
+                    stats == null ? null : stats.getHistory().getLatestCompletedCheckpoint();
+            if (latestCompleted != null && latestCompleted.getPersistedData() > 0) {
+                return latestCompleted.getExternalPath();
+            }
+
+            if (graph.getState().isGloballyTerminalState()) {
+                final String reason =
+                        String.format(
+                                "%s (%s) terminated in state %s before completing a checkpoint"
+                                        + " with in-flight buffers",
+                                jobLabel, jobId, graph.getState());
+                logRecordsPerSubtask(reason, stats);
+                throw graph.getFailureInfo() == null
+                        ? new IllegalStateException(reason)
+                        : new IllegalStateException(reason, graph.getFailureInfo().getException());
+            }
+
+            if (!deadline.hasTimeLeft()) {
+                final String reason =
+                        String.format(
+                                "%s (%s) did not complete a checkpoint with in-flight buffers"
+                                        + " within %s",
+                                jobLabel, jobId, CHECKPOINT_WAIT_TIMEOUT);
+                logRecordsPerSubtask(reason, stats);
+                throw new TimeoutException(reason);
+            }
+
+            Thread.sleep(100);
+        }
+    }
+
+    /** Logs one summary line with the deployed parallelism of every operator of the job. */
+    private static void logParallelism(String jobLabel, JobID jobId, MiniCluster miniCluster)
+            throws Exception {
+        final AccessExecutionGraph graph = miniCluster.getExecutionGraph(jobId).get();
+        final StringJoiner parallelisms = new StringJoiner(", ");
+        for (AccessExecutionJobVertex vertex : graph.getVerticesTopologically()) {
+            parallelisms.add(vertex.getName() + "=" + vertex.getParallelism());
+        }
+        LOG.info("{} parallelism: {}", jobLabel, parallelisms);
+        logSystemResources(jobLabel + " running");
+    }
+
+    /**
+     * Logs CPU, RAM and swap usage of the host, to tell whether a stuck checkpoint correlates with
+     * an overloaded CI runner.
+     */
+    private static void logSystemResources(String context) {
+        try {
+            final HardwareAbstractionLayer hardware = new SystemInfo().getHardware();
+            final CentralProcessor processor = hardware.getProcessor();
+            final GlobalMemory memory = hardware.getMemory();
+            final VirtualMemory swap = memory.getVirtualMemory();
+            final long[] cpuTicks = processor.getSystemCpuLoadTicks();
+            Thread.sleep(500);
+            final double cpuLoad = processor.getSystemCpuLoadBetweenTicks(cpuTicks);
+            final double[] loadAverage = processor.getSystemLoadAverage(3);
+            final Runtime jvm = Runtime.getRuntime();
+            LOG.info(
+                    "System resources ({}): CPU: cores={}, usage={}%,"
+                            + " loadAverage(1m/5m/15m)={}/{}/{}"
+                            + " | RAM: used={}/{} MiB, available={} MiB, JVM heap used={}/{} MiB"
+                            + " | Swap: used={}/{} MiB",
+                    context,
+                    processor.getLogicalProcessorCount(),
+                    String.format("%.1f", cpuLoad * 100),
+                    String.format("%.2f", loadAverage[0]),
+                    String.format("%.2f", loadAverage[1]),
+                    String.format("%.2f", loadAverage[2]),
+                    toMiB(memory.getTotal() - memory.getAvailable()),
+                    toMiB(memory.getTotal()),
+                    toMiB(memory.getAvailable()),
+                    toMiB(jvm.totalMemory() - jvm.freeMemory()),
+                    toMiB(jvm.maxMemory()),
+                    toMiB(swap.getSwapUsed()),
+                    toMiB(swap.getSwapTotal()));
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        } catch (Exception e) {
+            LOG.warn("Could not log system resources ({})", context, e);
+        }
+    }
+
+    private static long toMiB(long bytes) {
+        return bytes >> 20;
+    }
+
+    private static void logRecordsPerSubtask(
+            String reason, @Nullable CheckpointStatsSnapshot stats) {
+        logSystemResources(reason);
+        LOG.info(
+                "{}. Checkpoints: completed={}, failed={}, inProgress={}. Records per subtask:",
+                reason,
+                stats == null ? "n/a" : stats.getCounts().getNumberOfCompletedCheckpoints(),
+                stats == null ? "n/a" : stats.getCounts().getNumberOfFailedCheckpoints(),
+                stats == null ? "n/a" : stats.getCounts().getNumberOfInProgressCheckpoints());
+        for (Map.Entry<String, RecordCounter> entry :
+                new TreeMap<>(RECORDS_PER_SUBTASK).entrySet()) {
+            LOG.info(
+                    "  {}: recordsIn={}, recordsOut={}",
+                    entry.getKey(),
+                    entry.getValue().in.get(),
+                    entry.getValue().out.get());
+        }
+    }
+
+    private static RecordCounter recordCounter(String operator, int subtaskIndex, int parallelism) {
+        return RECORDS_PER_SUBTASK.computeIfAbsent(
+                String.format("%s (%d/%d)", operator, subtaskIndex + 1, parallelism),
+                ignored -> new RecordCounter());
+    }
+
+    private static RecordCounter recordCounter(String operator, RuntimeContext context) {
+        return recordCounter(
+                operator,
+                context.getTaskInfo().getIndexOfThisSubtask(),
+                context.getTaskInfo().getNumberOfParallelSubtasks());
+    }
+
+    private static DataGeneratorSource<Long> createSource(String name) {
         return new DataGeneratorSource<>(
-                index -> index,
+                new CountingGenerator(name),
                 new NumberSequenceSource(0, Long.MAX_VALUE - 1) {
                     @Override
                     protected List<NumberSequenceSplit> splitNumberRange(
@@ -224,15 +452,79 @@ class UnalignedCheckpointRescaleMixedComplexityFixedParallelismCIITCase {
         }
     }
 
-    /** A simple CoMapFunction that passes values through without delay. */
-    private static class PassThroughCoMap implements CoMapFunction<Long, Long, Long> {
+    /** Records counts of a single subtask. */
+    private static class RecordCounter {
+        private final AtomicLong in = new AtomicLong();
+        private final AtomicLong out = new AtomicLong();
+    }
+
+    /** Emits the sequence index and counts the generated records per source subtask. */
+    private static class CountingGenerator implements GeneratorFunction<Long, Long> {
+        private final String name;
+        private transient RecordCounter counter;
+
+        private CountingGenerator(String name) {
+            this.name = name;
+        }
+
+        @Override
+        public void open(SourceReaderContext readerContext) {
+            counter =
+                    recordCounter(
+                            name,
+                            readerContext.getIndexOfSubtask(),
+                            readerContext.currentParallelism());
+        }
+
+        @Override
+        public Long map(Long index) {
+            counter.out.incrementAndGet();
+            return index;
+        }
+    }
+
+    /** A MapFunction that passes values through and counts them per subtask. */
+    private static class CountingMap extends RichMapFunction<Long, Long> {
+        private final String name;
+        private transient RecordCounter counter;
+
+        private CountingMap(String name) {
+            this.name = name;
+        }
+
+        @Override
+        public void open(OpenContext openContext) {
+            counter = recordCounter(name, getRuntimeContext());
+        }
+
+        @Override
+        public Long map(Long value) {
+            counter.in.incrementAndGet();
+            counter.out.incrementAndGet();
+            return value;
+        }
+    }
+
+    /** A CoMapFunction that passes values through without delay and counts them per subtask. */
+    private static class PassThroughCoMap extends RichCoMapFunction<Long, Long, Long> {
+        private transient RecordCounter counter;
+
+        @Override
+        public void open(OpenContext openContext) {
+            counter = recordCounter("Co-Map", getRuntimeContext());
+        }
+
         @Override
         public Long map1(Long value) {
+            counter.in.incrementAndGet();
+            counter.out.incrementAndGet();
             return value;
         }
 
         @Override
         public Long map2(Long value) {
+            counter.in.incrementAndGet();
+            counter.out.incrementAndGet();
             return value;
         }
     }
