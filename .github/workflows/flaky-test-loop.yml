@@ -90,7 +90,7 @@ env:
   # mode, a machine also stops at its first failed run. false: everything runs to the end.
   STOP_ON_FIRST_FAILURE: false
   # Java version: 11, 17 or 21 (the versions Flink CI tests with).
-  JDK: 17
+  JDK: 8
   # Extra Maven options, e.g. '-Penable-adaptive-scheduler' to match that nightly build.
   EXTRA_PROFILE: ''
   # The number of jobs GitHub runs at once for your plan: Free 20, Pro 40, Team 60,
@@ -127,7 +127,7 @@ jobs:
           done
           [ "$SHARDS" -ge 1 ] || fail "SHARDS must be at least 1."
           [ "$ROUNDS" -ge 1 ] || fail "ROUNDS must be at least 1."
-          case "$JDK" in 11|17|21) ;; *) fail "JDK must be 11, 17 or 21, got '$JDK'." ;; esac
+          case "$JDK" in 8|11|17|21) ;; *) fail "JDK must be 8, 11, 17 or 21, got '$JDK'." ;; esac
           case "$STOP_ON_FIRST_FAILURE" in true|false) ;; *) fail "STOP_ON_FIRST_FAILURE must be true or false." ;; esac
           [[ "$EXTRA_PROFILE" =~ ^[A-Za-z0-9\ ._=,:/+-]*$ ]] || fail "EXTRA_PROFILE may not contain quotes or other special characters."
           [ -n "$TEST" ] || fail "Full CI mode (TEST '') isn't available on release-1.20. Set TEST."
@@ -184,6 +184,7 @@ jobs:
             echo "stop-on-first-failure=$STOP_ON_FIRST_FAILURE"
             # same as the Java 11/17/21 jobs in nightly.yml of release-1.20, for the selected JDK
             case "$JDK" in
+              8)  jdk_flags="" ;;
               11) jdk_flags="-Djdk11" ;;
               17) jdk_flags="-Djdk11 -Djdk17" ;;
               21) jdk_flags="-Djdk11 -Djdk17 -Djdk21" ;;
@@ -200,8 +201,8 @@ jobs:
     runs-on: ubuntu-22.04
     container:
       # the image of the "Test" job in template.flink-ci.yml; change both together
-      image: apache/flink-ci-docker:java_8_11_17_21_25_maven_386_3916_noble
-      options: --init --privileged
+      image: apache/flink-ci-docker:java_8_11_17_21_25_maven_386_jammy
+      options: --init --privileged --memory 16g
       volumes:
         - /mnt:/root
     # GitHub's maximum for a job, so that only RUN_TIMEOUT_MINUTES limits the single runs
