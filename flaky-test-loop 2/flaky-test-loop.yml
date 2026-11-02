@@ -63,9 +63,9 @@ env:
   #   this workflow runs in (your fork).
   # - BEFORE_COUNT: test mode: the number of test runs. Full CI mode: the number of complete
   #   CI runs. 0 skips it.
-  BEFORE_COMMIT: '104f23c398a02d93df37331bac2d14a7b989aa7b'
+  BEFORE_COMMIT: 'flaky-loop/FLINK-40804'
   BEFORE_REPO: ''
-  BEFORE_COUNT: 1
+  BEFORE_COUNT: 100
   # The code with the fix, the same way.
   AFTER_COMMIT: ''
   AFTER_REPO: ''
@@ -74,14 +74,14 @@ env:
   # Surefire -Dtest syntax: 'Class#method', 'Class#m1+m2', 'ClassA,ClassB', 'Blob*Test':
   # TEST: 'MyTest#testA+testB'
   # The complete Flink CI:
-  TEST: 'UnalignedCheckpointRescaleWithMixedExchangesITCase'
+  TEST: 'UnalignedCheckpointRescaleMixedComplexityFixedParallelismCIITCase'
   # Test mode: the Maven module that contains the tests.
   MODULE: 'flink-tests'
   # Test mode: the most machines per commit.
   SHARDS: 5
   # How many times to run everything in this one workflow run (1 or more). GitHub runs at
   # most one round at once and starts the next round's jobs as earlier ones finish.
-  ROUNDS: 100
+  ROUNDS: 1
   # true: the first failure cancels everything still running or queued (all rounds). In test
   # mode, a machine also stops at its first failed run. false: everything runs to the end.
   STOP_ON_FIRST_FAILURE: false
@@ -266,7 +266,7 @@ jobs:
           reports="$MODULE/target/surefire-reports"
           runuser -u flink -- mkdir -p "$debug_dir"
           # common and test options from tools/ci/test_controller.sh
-          common="-Dfast -Pskip-webui-build -Dlog.dir=$debug_dir -Dlog4j.configurationFile=file://$PWD/tools/ci/log4j.properties"
+          common="-Dfast -Pskip-webui-build -Dlog.dir=$debug_dir -Dlog4j.configurationFile=file://$PWD/tools/ci/log4j-debug.properties"
           test_opts="-Dflink.tests.with-openssl -Dflink.tests.check-segment-multiple-free -Darchunit.freeze.store.default.allowStoreUpdate=false -Dpekko.rpc.force-invocation-serialization"
           # the selected tests, with the same surefire execution that runs unit tests in CI
           goals="surefire:test@default-test -Dtest=$TEST"
