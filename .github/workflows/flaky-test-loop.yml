@@ -240,6 +240,15 @@ jobs:
           mkdir -p ${{ env.CONTAINER_LOCAL_WORKING_DIR }} ${{ env.MAVEN_REPO_FOLDER }}
           chown -R flink:flink ${{ env.CONTAINER_LOCAL_WORKING_DIR }}
           chown -R flink:flink ${{ env.MAVEN_REPO_FOLDER }}
+      - name: "Print system resources"
+        run: |
+          echo "=== RAM & Swap ==="
+          free -h
+          echo "=== CPU ==="
+          echo "Logical CPUs: $(nproc)"
+          lscpu | grep -E 'Model name|CPU\(s\)|Thread\(s\) per core|MHz' || true
+          echo "=== Disk ==="
+          df -h /
       - name: "Build ${{ env.MODULE }} and its dependencies"
         working-directory: ${{ env.CONTAINER_LOCAL_WORKING_DIR }}
         run: |
@@ -260,6 +269,9 @@ jobs:
           failed=0
           done_runs=0
           for i in $(seq 1 "$RUNS"); do
+            echo "--- Resources before run $i ---"
+            free -h
+            echo "CPU load: $(uptime | awk -F'load average:' '{print $2}')"
             rm -rf "$reports"
             exit_code=0
             timeout --kill-after=1m "${RUN_TIMEOUT_MINUTES}m" \
