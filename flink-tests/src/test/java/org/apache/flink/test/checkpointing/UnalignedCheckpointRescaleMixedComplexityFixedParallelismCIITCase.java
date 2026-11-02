@@ -35,6 +35,8 @@ import org.apache.flink.configuration.Configuration;
 import org.apache.flink.configuration.ExternalizedCheckpointRetention;
 import org.apache.flink.configuration.RestartStrategyOptions;
 import org.apache.flink.configuration.StateRecoveryOptions;
+import org.apache.flink.configuration.MemorySize;
+import org.apache.flink.configuration.TaskManagerOptions;
 import org.apache.flink.connector.datagen.source.DataGeneratorSource;
 import org.apache.flink.connector.datagen.source.GeneratorFunction;
 import org.apache.flink.core.execution.JobClient;
@@ -87,8 +89,8 @@ import static org.apache.flink.configuration.RestartStrategyOptions.RestartStrat
  * CI-friendly variant of {@link UnalignedCheckpointRescaleMixedComplexityFixedParallelismITCase}.
  *
  * <p>Uses the same DAG topology, fixed parallelism scenarios, sleeping operators, and two-phase
- * test logic (checkpoint then rescale), but omits the 1 KB memory segment override and
- * file-merging, making it suitable for GitHub Actions.
+ * test logic (checkpoint then rescale). Sources run at 5,000 rec/sec each (10,000 total), and the
+ * 1 KB memory segment size matches the original test to maximize in-flight buffer pressure.
  */
 @ExtendWith(ParameterizedTestExtension.class)
 class UnalignedCheckpointRescaleMixedComplexityFixedParallelismCIITCase {
@@ -222,6 +224,7 @@ class UnalignedCheckpointRescaleMixedComplexityFixedParallelismCIITCase {
                 ExternalizedCheckpointRetention.RETAIN_ON_CANCELLATION);
         conf.set(CheckpointingOptions.CHECKPOINTS_DIRECTORY, temporaryFolder.toURI().toString());
         conf.set(CheckpointingOptions.ENABLE_UNALIGNED, true);
+        conf.set(TaskManagerOptions.MEMORY_SEGMENT_SIZE, MemorySize.parse("1 kb"));
         if (recoveryPath != null) {
             conf.set(StateRecoveryOptions.SAVEPOINT_PATH, recoveryPath);
         }
@@ -433,7 +436,7 @@ class UnalignedCheckpointRescaleMixedComplexityFixedParallelismCIITCase {
                         return super.splitNumberRange(from, to, MAX_SLOTS);
                     }
                 },
-                RateLimiterStrategy.perSecond(500),
+                RateLimiterStrategy.perSecond(5000),
                 Types.LONG);
     }
 
