@@ -86,9 +86,9 @@ import static org.apache.flink.configuration.RestartStrategyOptions.RestartStrat
 /**
  * CI-friendly variant of {@link UnalignedCheckpointRescaleMixedComplexityFixedParallelismITCase}.
  *
- * <p>Uses the same DAG topology, fixed parallelism scenarios, and two-phase test logic (checkpoint
- * then rescale), but omits the artificial load created by sleeping operators, the 1 KB memory
- * segment override, and file-merging, making it suitable for GitHub Actions.
+ * <p>Uses the same DAG topology, fixed parallelism scenarios, sleeping operators, and two-phase
+ * test logic (checkpoint then rescale), but omits the 1 KB memory segment override and
+ * file-merging, making it suitable for GitHub Actions.
  */
 @ExtendWith(ParameterizedTestExtension.class)
 class UnalignedCheckpointRescaleMixedComplexityFixedParallelismCIITCase {
@@ -264,26 +264,26 @@ class UnalignedCheckpointRescaleMixedComplexityFixedParallelismCIITCase {
 
         // Keep the same parallelism to ensure the ForwardPartitioner will be used.
         DataStream<Long> forwardedStream =
-                sourceStream2.map(new CountingMap("Map")).setParallelism(source2Par);
+                sourceStream2.map(new CountingMap("Map", 0)).setParallelism(source2Par);
 
         DataStream<Long> multiInputMap =
                 sourceStream1
                         .rebalance()
                         .connect(forwardedStream.rebalance())
-                        .map(new PassThroughCoMap())
+                        .map(new SleepingCoMap())
                         .name("Co-Map")
                         .setParallelism(coMapPar);
 
         // Multi-output part
         multiInputMap
                 .keyBy((KeySelector<Long, Long>) value -> value)
-                .map(new CountingMap("Map after keyBy"))
+                .map(new CountingMap("Map after keyBy", 5)) // ~200 rec/sec per subtask
                 .name("Map after keyBy")
                 .setParallelism(mapKeyByPar);
 
         // Keep the same parallelism to ensure the ForwardPartitioner will be used.
         multiInputMap
-                .map(new CountingMap("Map after forward"))
+                .map(new CountingMap("Map after forward", 1))
                 .name("Map after forward")
                 .setParallelism(multiInputMap.getParallelism());
 
@@ -483,13 +483,18 @@ class UnalignedCheckpointRescaleMixedComplexityFixedParallelismCIITCase {
         }
     }
 
-    /** A MapFunction that passes values through and counts them per subtask. */
+    /**
+     * A MapFunction that passes values through, optionally sleeping for each element to create
+     * backpressure, and counts them per subtask.
+     */
     private static class CountingMap extends RichMapFunction<Long, Long> {
         private final String name;
+        private final long sleepMillis;
         private transient RecordCounter counter;
 
-        private CountingMap(String name) {
+        private CountingMap(String name, long sleepMillis) {
             this.name = name;
+            this.sleepMillis = sleepMillis;
         }
 
         @Override
@@ -498,15 +503,18 @@ class UnalignedCheckpointRescaleMixedComplexityFixedParallelismCIITCase {
         }
 
         @Override
-        public Long map(Long value) {
+        public Long map(Long value) throws Exception {
             counter.in.incrementAndGet();
+            if (sleepMillis > 0) {
+                Thread.sleep(sleepMillis);
+            }
             counter.out.incrementAndGet();
             return value;
         }
     }
 
-    /** A CoMapFunction that passes values through without delay and counts them per subtask. */
-    private static class PassThroughCoMap extends RichCoMapFunction<Long, Long, Long> {
+    /** A CoMapFunction that sleeps for 1ms for each element and counts them per subtask. */
+    private static class SleepingCoMap extends RichCoMapFunction<Long, Long, Long> {
         private transient RecordCounter counter;
 
         @Override
@@ -515,15 +523,18 @@ class UnalignedCheckpointRescaleMixedComplexityFixedParallelismCIITCase {
         }
 
         @Override
-        public Long map1(Long value) {
-            counter.in.incrementAndGet();
-            counter.out.incrementAndGet();
-            return value;
+        public Long map1(Long value) throws Exception {
+            return sleepAndCount(value);
         }
 
         @Override
-        public Long map2(Long value) {
+        public Long map2(Long value) throws Exception {
+            return sleepAndCount(value);
+        }
+
+        private Long sleepAndCount(Long value) throws InterruptedException {
             counter.in.incrementAndGet();
+            Thread.sleep(1);
             counter.out.incrementAndGet();
             return value;
         }

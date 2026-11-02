@@ -109,7 +109,7 @@ env:
 jobs:
   settings:
     name: "Settings"
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-22.04
     outputs:
       mode: ${{ steps.read.outputs.mode }}
       matrix: ${{ steps.read.outputs.matrix }}
@@ -197,7 +197,7 @@ jobs:
     name: "R${{ matrix.round }}: ${{ matrix.variant }} shard ${{ matrix.shard }} · Build + Test (module: ${{ needs.settings.outputs.module }}) × ${{ matrix.runs }} ${{ matrix.runs == 1 && 'run' || 'runs' }}"
     needs: settings
     if: needs.settings.outputs.mode == 'loop'
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-22.04
     container:
       # the image of the "Test" job in template.flink-ci.yml; change both together
       image: apache/flink-ci-docker:java_8_11_17_21_25_maven_386_3916_noble
