@@ -298,7 +298,7 @@ class UnalignedCheckpointRescaleMixedComplexityFixedParallelismCIITCase {
     /**
      * Waits until a checkpoint with in-flight buffers completes and returns its path. Unlike {@link
      * CommonTestUtils#waitForCheckpointWithInflightBuffers}, the wait is bounded, and the records
-     * per subtask are logged if the job terminates first or the wait times out.
+     * per subtask are logged both on success and on failure/timeout.
      */
     private static String waitForCheckpointWithInflightBuffers(
             String jobLabel, JobID jobId, MiniCluster miniCluster) throws Exception {
@@ -309,6 +309,11 @@ class UnalignedCheckpointRescaleMixedComplexityFixedParallelismCIITCase {
             final CompletedCheckpointStats latestCompleted =
                     stats == null ? null : stats.getHistory().getLatestCompletedCheckpoint();
             if (latestCompleted != null && latestCompleted.getPersistedData() > 0) {
+                logRecordsPerSubtask(
+                        String.format(
+                                "%s (%s) completed checkpoint with in-flight buffers",
+                                jobLabel, jobId),
+                        stats);
                 return latestCompleted.getExternalPath();
             }
 
