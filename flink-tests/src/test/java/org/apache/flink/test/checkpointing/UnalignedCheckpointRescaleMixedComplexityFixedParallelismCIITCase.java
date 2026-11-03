@@ -280,7 +280,7 @@ class UnalignedCheckpointRescaleMixedComplexityFixedParallelismCIITCase {
         // Multi-output part
         multiInputMap
                 .keyBy((KeySelector<Long, Long>) value -> value)
-                .map(new CountingMap("Map after keyBy", 4)) // ~250 rec/sec per subtask
+                .map(new CountingMap("Map after keyBy", 3)) // ~333 rec/sec per subtask
                 .name("Map after keyBy")
                 .setParallelism(mapKeyByPar);
 
