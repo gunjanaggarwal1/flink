@@ -130,7 +130,7 @@ class UnalignedCheckpointRescaleMixedComplexityFixedParallelismCIITCase {
      */
     private enum Scenario {
         /** Parallelisms observed to fail on the jdk17 CI run. */
-        JDK17(new DagParallelism(8, 5, 10, 6), new DagParallelism(2, 4, 4, 1));
+        JDK17(new DagParallelism(8, 5, 10, 6), new DagParallelism(2, 4, 4, 10));
 
         private final DagParallelism initial;
         private final DagParallelism rescaled;
@@ -277,7 +277,7 @@ class UnalignedCheckpointRescaleMixedComplexityFixedParallelismCIITCase {
         // Multi-output part
         multiInputMap
                 .keyBy((KeySelector<Long, Long>) value -> value)
-                .map(new CountingMap("Map after keyBy", 3)) 
+                .map(new CountingMap("Map after keyBy", 5)) 
                 .name("Map after keyBy")
                 .setParallelism(mapKeyByPar);
 
