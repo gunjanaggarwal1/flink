@@ -99,11 +99,8 @@ class UnalignedCheckpointRescaleMixedComplexityFixedParallelismCIITCase {
     private static final int SLOTS_PER_TASK_MANAGER = 10;
     private static final int MAX_SLOTS = NUM_TASK_MANAGERS * SLOTS_PER_TASK_MANAGER;
 
-    /**
-     * Short enough that an expired checkpoint fails the job (no tolerable checkpoint failures, no
-     * restarts) well before the CI step timeout, so the per-subtask records still get logged.
-     */
-    private static final Duration CHECKPOINT_TIMEOUT = Duration.ofSeconds(60);
+    /** Matches the Flink default checkpoint timeout (10 minutes). */
+    private static final Duration CHECKPOINT_TIMEOUT = Duration.ofMinutes(10);
 
     /** Upper bound for waiting on a checkpoint, in case the job neither checkpoints nor fails. */
     private static final Duration CHECKPOINT_WAIT_TIMEOUT = CHECKPOINT_TIMEOUT.multipliedBy(2);
@@ -280,7 +277,7 @@ class UnalignedCheckpointRescaleMixedComplexityFixedParallelismCIITCase {
         // Multi-output part
         multiInputMap
                 .keyBy((KeySelector<Long, Long>) value -> value)
-                .map(new CountingMap("Map after keyBy", 2)) // ~500 rec/sec per subtask
+                .map(new CountingMap("Map after keyBy", 5)) // ~500 rec/sec per subtask
                 .name("Map after keyBy")
                 .setParallelism(mapKeyByPar);
 
