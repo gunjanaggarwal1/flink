@@ -188,7 +188,8 @@ class UnalignedCheckpointRescaleMixedComplexityFixedParallelismCIITCase {
             throws Exception {
         // Phase 1: initial job with safe parallelism — checkpoint completes fine
         JobClient jobClient1 =
-                createMixedComplexityDAG(getUnalignedCheckpointEnv(null), 9, 7, 9, 6);
+                createMixedComplexityDAG(
+                        getUnalignedCheckpointEnv(null), Scenario.JDK17.initial);
         CommonTestUtils.waitForJobStatus(jobClient1, Collections.singletonList(JobStatus.RUNNING));
         CommonTestUtils.waitForAllTaskRunning(miniCluster, jobClient1.getJobID(), false);
         logParallelism("Job 1", jobClient1.getJobID(), miniCluster);
@@ -196,12 +197,12 @@ class UnalignedCheckpointRescaleMixedComplexityFixedParallelismCIITCase {
                 waitForCheckpointWithInflightBuffers("Job 1", jobClient1.getJobID(), miniCluster);
         CommonTestUtils.terminateJob(jobClient1);
 
-        // Phase 2: rescaled job with coMapPar=2
-        // 10,000 rec/sec total into Co-Map, 2 subtasks → 5,000 rec/sec per subtask
-        // Map after forward: FORWARD (aligned checkpoint), sleep(1ms) = 1,000 rec/sec capacity
-        // 5x overload → aligned checkpoint barrier stuck in full buffers → checkpoint expires
+        // Phase 2: rescaled job. "Map after forward" keeps the Co-Map parallelism over a FORWARD
+        // exchange, so it still checkpoints aligned. Once the sources outrun its sleep-limited
+        // throughput, the barrier gets stuck behind full buffers and the checkpoint expires.
         JobClient jobClient2 =
-                createMixedComplexityDAG(getUnalignedCheckpointEnv(checkpointPath), 1, 5, 2, 1);
+                createMixedComplexityDAG(
+                        getUnalignedCheckpointEnv(checkpointPath), Scenario.JDK17.rescaled);
         CommonTestUtils.waitForJobStatus(jobClient2, Collections.singletonList(JobStatus.RUNNING));
         CommonTestUtils.waitForAllTaskRunning(miniCluster, jobClient2.getJobID(), false);
         logParallelism("Job 2", jobClient2.getJobID(), miniCluster);
