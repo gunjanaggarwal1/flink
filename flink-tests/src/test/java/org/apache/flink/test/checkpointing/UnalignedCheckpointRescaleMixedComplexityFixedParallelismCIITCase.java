@@ -80,6 +80,7 @@ import java.util.Map;
 import java.util.StringJoiner;
 import java.util.TreeMap;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -98,6 +99,12 @@ class UnalignedCheckpointRescaleMixedComplexityFixedParallelismCIITCase {
     private static final int NUM_TASK_MANAGERS = 1;
     private static final int SLOTS_PER_TASK_MANAGER = 10;
     private static final int MAX_SLOTS = NUM_TASK_MANAGERS * SLOTS_PER_TASK_MANAGER;
+
+    // Use 100-char String records instead of Long to increase per-record size. With Long (8 bytes),
+    // each buffer holds thousands of records, causing excessive backpressure during aligned
+    // checkpoint phases (forward/rescale exchanges). Larger String records reduce the record count
+    // per buffer, shortening the time needed to drain backpressured buffers.
+    private static final int RECORD_LENGTH = 100;
 
     /** Matches the Flink default checkpoint timeout (10 minutes). */
     private static final Duration CHECKPOINT_TIMEOUT = Duration.ofMinutes(10);
@@ -130,7 +137,7 @@ class UnalignedCheckpointRescaleMixedComplexityFixedParallelismCIITCase {
      */
     private enum Scenario {
         /** Parallelisms observed to fail on the jdk17 CI run. */
-        JDK17(new DagParallelism(8, 5, 10, 6), new DagParallelism(2, 4, 4, 10));
+        JDK17(new DagParallelism(9, 7, 9, 6), new DagParallelism(1, 5, 2, 1));
 
         private final DagParallelism initial;
         private final DagParallelism rescaled;
@@ -249,14 +256,14 @@ class UnalignedCheckpointRescaleMixedComplexityFixedParallelismCIITCase {
             int mapKeyByPar)
             throws Exception {
         // Multi-input part
-        DataStream<Long> sourceStream1 =
+        DataStream<String> sourceStream1 =
                 env.fromSource(
                                 createSource("Source 1"),
                                 WatermarkStrategy.noWatermarks(),
                                 "Source 1")
                         .setParallelism(source1Par);
 
-        DataStream<Long> sourceStream2 =
+        DataStream<String> sourceStream2 =
                 env.fromSource(
                                 createSource("Source 2"),
                                 WatermarkStrategy.noWatermarks(),
@@ -264,10 +271,10 @@ class UnalignedCheckpointRescaleMixedComplexityFixedParallelismCIITCase {
                         .setParallelism(source2Par);
 
         // Keep the same parallelism to ensure the ForwardPartitioner will be used.
-        DataStream<Long> forwardedStream =
+        DataStream<String> forwardedStream =
                 sourceStream2.map(new CountingMap("Map", 0)).setParallelism(source2Par);
 
-        DataStream<Long> multiInputMap =
+        DataStream<String> multiInputMap =
                 sourceStream1
                         .rebalance()
                         .connect(forwardedStream.rebalance())
@@ -277,7 +284,7 @@ class UnalignedCheckpointRescaleMixedComplexityFixedParallelismCIITCase {
 
         // Multi-output part
         multiInputMap
-                .keyBy((KeySelector<Long, Long>) value -> value)
+                .keyBy((KeySelector<String, String>) value -> value)
                 .map(new CountingMap("Map after keyBy", 5)) 
                 .name("Map after keyBy")
                 .setParallelism(mapKeyByPar);
@@ -429,7 +436,7 @@ class UnalignedCheckpointRescaleMixedComplexityFixedParallelismCIITCase {
                 context.getTaskInfo().getNumberOfParallelSubtasks());
     }
 
-    private static DataGeneratorSource<Long> createSource(String name) {
+    private static DataGeneratorSource<String> createSource(String name) {
         return new DataGeneratorSource<>(
                 new CountingGenerator(name),
                 new NumberSequenceSource(0, Long.MAX_VALUE - 1) {
@@ -440,7 +447,7 @@ class UnalignedCheckpointRescaleMixedComplexityFixedParallelismCIITCase {
                     }
                 },
                 RateLimiterStrategy.perSecond(5000),
-                Types.LONG);
+                Types.STRING);
     }
 
     /** Parallelism of each independently scalable operator in the mixed complexity DAG. */
@@ -464,8 +471,8 @@ class UnalignedCheckpointRescaleMixedComplexityFixedParallelismCIITCase {
         private final AtomicLong out = new AtomicLong();
     }
 
-    /** Emits the sequence index and counts the generated records per source subtask. */
-    private static class CountingGenerator implements GeneratorFunction<Long, Long> {
+    /** Emits a random record and counts the generated records per source subtask. */
+    private static class CountingGenerator implements GeneratorFunction<Long, String> {
         private final String name;
         private transient RecordCounter counter;
 
@@ -483,9 +490,14 @@ class UnalignedCheckpointRescaleMixedComplexityFixedParallelismCIITCase {
         }
 
         @Override
-        public Long map(Long index) {
+        public String map(Long index) {
+            ThreadLocalRandom rnd = ThreadLocalRandom.current();
+            StringBuilder sb = new StringBuilder(RECORD_LENGTH);
+            for (int i = 0; i < RECORD_LENGTH; i++) {
+                sb.append((char) ('a' + rnd.nextInt(26)));
+            }
             counter.out.incrementAndGet();
-            return index;
+            return sb.toString();
         }
     }
 
@@ -493,7 +505,7 @@ class UnalignedCheckpointRescaleMixedComplexityFixedParallelismCIITCase {
      * A MapFunction that passes values through, optionally sleeping for each element to create
      * backpressure, and counts them per subtask.
      */
-    private static class CountingMap extends RichMapFunction<Long, Long> {
+    private static class CountingMap extends RichMapFunction<String, String> {
         private final String name;
         private final long sleepMillis;
         private transient RecordCounter counter;
@@ -509,7 +521,7 @@ class UnalignedCheckpointRescaleMixedComplexityFixedParallelismCIITCase {
         }
 
         @Override
-        public Long map(Long value) throws Exception {
+        public String map(String value) throws Exception {
             counter.in.incrementAndGet();
             if (sleepMillis > 0) {
                 Thread.sleep(sleepMillis);
@@ -520,7 +532,7 @@ class UnalignedCheckpointRescaleMixedComplexityFixedParallelismCIITCase {
     }
 
     /** A CoMapFunction that sleeps for 1ms for each element and counts them per subtask. */
-    private static class SleepingCoMap extends RichCoMapFunction<Long, Long, Long> {
+    private static class SleepingCoMap extends RichCoMapFunction<String, String, String> {
         private transient RecordCounter counter;
 
         @Override
@@ -529,16 +541,16 @@ class UnalignedCheckpointRescaleMixedComplexityFixedParallelismCIITCase {
         }
 
         @Override
-        public Long map1(Long value) throws Exception {
+        public String map1(String value) throws Exception {
             return sleepAndCount(value);
         }
 
         @Override
-        public Long map2(Long value) throws Exception {
+        public String map2(String value) throws Exception {
             return sleepAndCount(value);
         }
 
-        private Long sleepAndCount(Long value) throws InterruptedException {
+        private String sleepAndCount(String value) throws InterruptedException {
             counter.in.incrementAndGet();
             Thread.sleep(1);
             counter.out.incrementAndGet();
