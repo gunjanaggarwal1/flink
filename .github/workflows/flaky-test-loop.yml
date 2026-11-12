@@ -77,8 +77,8 @@ env:
   # Surefire -Dtest syntax: 'Class#method', 'Class#m1+m2', 'ClassA,ClassB', 'Blob*Test':
   # TEST: 'MyTest#testA+testB'
   # The complete Flink CI:
-  # FLINK-40804: CI-friendly test without stress operators
-  TEST: 'UnalignedCheckpointRescaleMixedComplexityFixedParallelismCIITCase'
+  # FLINK-40804: the original mixed-exchanges test, with 100-char String records
+  TEST: 'UnalignedCheckpointRescaleWithMixedExchangesITCase'
   # Test mode: the Maven module that contains the tests.
   MODULE: 'flink-tests'
   # Test mode: the most machines per commit.
