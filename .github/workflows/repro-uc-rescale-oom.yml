@@ -183,6 +183,7 @@ jobs:
       # longer reproduces the original environment exactly.
       - name: "Enable native memory tracking (deviates from original env)"
         if: ${{ inputs.diagnostics }}
+        shell: bash
         run: |
           {
             echo 'MAVEN_ARGS<<EOF'
@@ -225,6 +226,8 @@ jobs:
         if: ${{ inputs.scope == 'class' }}
         working-directory: ${{ env.CONTAINER_LOCAL_WORKING_DIR }}
         timeout-minutes: 330
+        # the container's default shell is dash; this script needs bash
+        shell: bash
         env:
           ITERATIONS: ${{ inputs.iterations_per_job }}
         run: |
@@ -282,6 +285,7 @@ jobs:
       # ---------------- shared reporting ------------------------------------
       - name: "Check for the direct-memory OOM (module scope)"
         if: ${{ always() && inputs.scope == 'module' && steps.test-run.outputs.debug-files-output-dir != '' }}
+        shell: bash
         run: |
           DIR="${{ steps.test-run.outputs.debug-files-output-dir }}"
           if grep -rqs "direct buffer memory" "$DIR"; then
