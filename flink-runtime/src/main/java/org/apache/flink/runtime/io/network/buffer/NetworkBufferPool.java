@@ -321,11 +321,33 @@ public class NetworkBufferPool
             isDestroyed = true;
         }
 
+        int freed = 0;
         synchronized (availableMemorySegments) {
             MemorySegment segment;
             while ((segment = availableMemorySegments.poll()) != null) {
                 segment.free();
+                freed++;
             }
+        }
+
+        // FLINK-41248 diagnostic (not for merge): segments still checked out when the pool is
+        // destroyed are never passed to free(), so their direct memory is only reclaimed if the
+        // owning DirectByteBuffer becomes unreachable. Log the shortfall so a module run shows
+        // whether mini-cluster teardowns strand segments and how much direct memory that is.
+        final int stranded = totalNumberOfMemorySegments - freed;
+        if (stranded > 0) {
+            LOG.warn(
+                    "FLINK-41248-STRANDED: destroy() freed {} of {} segments, {} stranded ({} MB "
+                            + "of direct memory not explicitly freed, segmentSize={})",
+                    freed,
+                    totalNumberOfMemorySegments,
+                    stranded,
+                    (((long) stranded * memorySegmentSize) >> 20),
+                    memorySegmentSize);
+        } else {
+            LOG.info(
+                    "FLINK-41248-STRANDED: destroy() freed all {} segments",
+                    totalNumberOfMemorySegments);
         }
     }
 

@@ -77,6 +77,10 @@ on:
         description: "Add NMT to the test JVMs. DEVIATES from the original environment - leave off for a faithful repro."
         default: false
         type: boolean
+      max_direct_memory:
+        description: "Value for -XX:MaxDirectMemorySize on the ITCase forks, e.g. 256m. Empty = leave unset, which is the nightly's behaviour (the JVM then defaults the direct ceiling to -Xmx1536m). Setting a smaller value shrinks the headroom so the FLINK-41248 exhaustion fires after a handful of cases instead of ~79. DEVIATES from the original environment."
+        default: ""
+        type: string
 
 permissions: read-all
 
@@ -203,16 +207,33 @@ jobs:
         working-directory: ${{ env.CONTAINER_LOCAL_WORKING_DIR }}
         run: ./tools/azure-pipelines/cache_docker_images.sh load
 
-      # Optional, OFF by default. Enabling this changes the JVM flags and so no
+      # Optional, both OFF by default. Either one changes the JVM flags and so no
       # longer reproduces the original environment exactly.
-      - name: "Enable native memory tracking (deviates from original env)"
-        if: ${{ inputs.diagnostics }}
+      #
+      # The baseArgLine below restates pom.xml's flink.surefire.baseArgLine plus
+      # flink-tests' surefire.module.config, because overriding the property on
+      # the command line replaces it wholesale. Keep them in sync.
+      - name: "Override ITCase JVM flags (deviates from original env)"
+        if: ${{ inputs.diagnostics || inputs.max_direct_memory != '' }}
         shell: bash
+        env:
+          MAX_DIRECT: ${{ inputs.max_direct_memory }}
+          WITH_NMT: ${{ inputs.diagnostics }}
         run: |
+          ARGLINE='-XX:+UseG1GC -Xms256m -XX:+IgnoreUnrecognizedVMOptions'
+          ARGLINE="$ARGLINE --add-opens=java.base/java.util=ALL-UNNAMED"
+          ARGLINE="$ARGLINE --add-opens=java.base/java.io=ALL-UNNAMED"
+          if [ "$WITH_NMT" = "true" ]; then
+            ARGLINE="$ARGLINE -XX:NativeMemoryTracking=summary -XX:+UnlockDiagnosticVMOptions -XX:+PrintNMTStatistics"
+          fi
+          if [ -n "$MAX_DIRECT" ]; then
+            ARGLINE="$ARGLINE -XX:MaxDirectMemorySize=$MAX_DIRECT"
+          fi
+          echo "Using ITCase argLine: $ARGLINE"
           {
             echo 'MAVEN_ARGS<<EOF'
             echo '-Dmaven.repo.local=/root/.m2/repository'
-            echo '-Dflink.surefire.baseArgLine=-XX:+UseG1GC -Xms256m -XX:+IgnoreUnrecognizedVMOptions --add-opens=java.base/java.util=ALL-UNNAMED --add-opens=java.base/java.io=ALL-UNNAMED -XX:NativeMemoryTracking=summary -XX:+UnlockDiagnosticVMOptions -XX:+PrintNMTStatistics'
+            echo "-Dflink.surefire.baseArgLine=$ARGLINE"
             echo 'EOF'
           } >> "$GITHUB_ENV"
 
@@ -329,6 +350,31 @@ jobs:
             grep -rhos "UnalignedCheckpointRescaleITCase.shouldRescaleUnalignedCheckpoint\[[^]]*\]" "$DIR" | sort -u | head -5
           else
             echo "No direct-memory OOM in run ${{ matrix.run }}."
+          fi
+
+      # FLINK-41248 retention evidence. NetworkBufferPool.destroy() only frees segments that were
+      # returned to the pool; anything still checked out at teardown is left to GC. The patched
+      # destroy() logs the shortfall, so this step answers "do mini-cluster teardowns strand
+      # direct memory, and how much" even when the OOM itself does not fire.
+      - name: "Summarise stranded network buffer segments"
+        if: ${{ always() && inputs.scope == 'module' && steps.test-run.outputs.debug-files-output-dir != '' }}
+        shell: bash
+        run: |
+          DIR="${{ steps.test-run.outputs.debug-files-output-dir }}"
+          TOTAL_DESTROYS=$(grep -rhos "FLINK-41248-STRANDED: destroy()" "$DIR" | wc -l)
+          LEAKY=$(grep -rhos "FLINK-41248-STRANDED: destroy() freed [0-9]* of [0-9]* segments" "$DIR" | wc -l)
+          echo "=========================================================="
+          echo "run ${{ matrix.run }}: NetworkBufferPool.destroy() calls = $TOTAL_DESTROYS"
+          echo "run ${{ matrix.run }}: teardowns that stranded segments   = $LEAKY"
+          echo "=========================================================="
+          if [ "$LEAKY" -gt 0 ]; then
+            echo "Total direct memory never explicitly freed (MB), summed over teardowns:"
+            grep -rhos "FLINK-41248-STRANDED:.*(\([0-9]*\) MB of direct memory" "$DIR" \
+              | grep -oE "\(([0-9]+) MB" | grep -oE "[0-9]+" \
+              | awk '{s+=$1} END {print (NR ? s : 0) " MB across " NR " teardowns"}'
+            echo "--- worst 10 teardowns ---"
+            grep -rhos "FLINK-41248-STRANDED: destroy() freed [0-9]* of [0-9]* segments, [0-9]* stranded ([0-9]* MB[^)]*)" "$DIR" \
+              | sort -u | sort -t, -k2 -rn | head -10
           fi
 
       - name: "Post-process build artifacts"
