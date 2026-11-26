@@ -243,6 +243,13 @@ jobs:
         env:
           ITERATIONS: ${{ inputs.iterations_per_job }}
         run: |
+          # GitHub runs "shell: bash" as "bash -e", and maven-utils.sh probes the
+          # Alibaba mirror with "curl | grep" at source time. That grep exits
+          # non-zero whenever the mirror is unreachable, which aborts the whole
+          # step before a single iteration. The official run_mvn action disables
+          # errexit for the same reason. The loop below also needs it off so it
+          # can read $? from each run and keep going after a failing iteration.
+          set +o errexit
           set -uo pipefail
           ${{ env.FLINK_ENVIRONMENT }}
           source ./tools/ci/maven-utils.sh
