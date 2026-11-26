@@ -39,9 +39,21 @@
 # JDK, Maven profile, fork counts, randomization and watchdog all match the run
 # that failed. The ONLY additions are the shard matrix and the log capture.
 #
-# Do not reduce this to a single test class. reuseForks=false gives every
-# ITCase class a fresh JVM, and the OOM only appears ~163 MiniCluster
-# lifecycles into UnalignedCheckpointRescaleITCase, inside the full module run.
+# Do not reduce this to a single test class. An earlier version of this comment
+# claimed "reuseForks=false gives every ITCase class a fresh JVM" - that is
+# wrong. pom.xml sets flink.reuseForks=true, so a surefire fork is REUSED across
+# test classes and direct memory accumulates across all of them.
+#
+# Evidence from the artifact of the failing nightly (run 40052503223, mvn-4.log):
+# the OOM struck 637 ms into the 79th shouldRescaleUnalignedCheckpoint case, on a
+# JVM already holding 1610596643 of 1610612736 bytes. The limit is -Xmx1536m
+# (flink.XmxITCase) with no explicit -XX:MaxDirectMemorySize, so the JVM defaults
+# the direct ceiling to Xmx. The failing allocation was not a Flink network
+# buffer but Netty's 16 KB epoll IovArray - the first small request to find the
+# ceiling full, not the thing that filled it.
+#
+# A single-class run therefore starts from a nearly empty ceiling and is not
+# expected to reproduce. Use scope=module.
 ---
 name: "FLINK-41248 repro: release-1.20 Java 17 'tests' direct-memory OOM"
 
@@ -49,16 +61,16 @@ on:
   workflow_dispatch:
     inputs:
       scope:
-        description: "class = run only UnalignedCheckpointRescaleITCase (~8 min/run). module = run the whole 'tests' module exactly as the nightly does (~45 min/run)."
-        default: "class"
+        description: "module = run the whole 'tests' module exactly as the failing nightly did (~45 min/run); this is the scope that reproduces FLINK-41248. class = run only UnalignedCheckpointRescaleITCase (~8 min/run), cheaper but historically does NOT reproduce the OOM."
+        default: "module"
         type: choice
-        options: ["class", "module"]
+        options: ["module", "class"]
       jobs_count:
-        description: "Number of parallel jobs."
-        default: "2"
+        description: "Number of parallel jobs. In module scope this is the number of full 'tests' module runs attempted."
+        default: "10"
         type: string
       iterations_per_job:
-        description: "Runs per job. Total runs = jobs_count x iterations_per_job. Only applies to scope=class; module scope is always 1."
+        description: "Runs per job. Only applies to scope=class; module scope is always 1 run per job, matching the nightly."
         default: "5"
         type: string
       diagnostics:
