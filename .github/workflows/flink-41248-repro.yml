@@ -250,7 +250,11 @@ jobs:
           # errexit for the same reason. The loop below also needs it off so it
           # can read $? from each run and keep going after a failing iteration.
           set +o errexit
-          set -uo pipefail
+          # No "set -u" either: run_mvn in maven-utils.sh reads $MVN_RUN_VERBOSE
+          # (and $MVN_GLOBAL_OPTIONS, $MAVEN_MIRROR_CONFIG_FILE) without a
+          # default, so nounset kills the first iteration with "MVN_RUN_VERBOSE:
+          # unbound variable". The official run_mvn action does not set it.
+          set -o pipefail
           ${{ env.FLINK_ENVIRONMENT }}
           source ./tools/ci/maven-utils.sh
 
