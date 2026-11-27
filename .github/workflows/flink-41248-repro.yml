@@ -1,0 +1,414 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+#
+# FLINK-41248: UnalignedCheckpointRescaleITCase.shouldRescaleUnalignedCheckpoint
+# fails with OutOfMemoryError: Direct buffer memory in the Netty server.
+# https://issues.apache.org/jira/browse/FLINK-41248
+#
+# Reported against 1.20.6, from the release-1.20 nightly of 2026-10-24:
+# https://github.com/apache/flink/actions/runs/40052503223/job/120756786222
+#
+# THIS BRANCH IS THE FAITHFUL VARIANT. It carries no source changes and no
+# diagnostic hooks, and it is based on 1263b16bc6d - the exact commit the
+# failing nightly ran (head_sha of run 40052503223), not the release-1.20 tip.
+# Verified identical to that commit's nightly:
+#   container  apache/flink-ci-docker:java_8_11_17_21_25_maven_386_3916_noble
+#   profile    PROFILE="-Dinclude_hadoop_aws -Djdk11 -Djdk17 -Pjava17-target"
+#   jdk        17
+#   runner     ubuntu-22.04
+#   command    uploading_watchdog.sh ./tools/ci/test_controller.sh tests
+#
+# One known divergence remains and cannot be closed from a fork: IT_CASE_S3_*
+# secrets are set on apache/flink but empty here, so some tests in the module
+# skip. That changes the allocation history the JVM accumulates.
+#
+# Faithful replica of the nightly job "Java 17 / Test (module: tests)", run N
+# times in parallel to reproduce the direct-memory OOM seen in
+# UnalignedCheckpointRescaleITCase:
+#
+#   java.lang.OutOfMemoryError: Cannot reserve 16384 bytes of direct buffer
+#   memory (allocated: 1610596643, limit: 1610612736)
+#
+# The visible failure is a RemoteTransportException ("Connection unexpectedly
+# closed by remote task manager"); the OOM above is the real cause and appears
+# earlier, in the TaskManager's Netty server (PartitionRequestQueue), during the
+# initial run that precedes the rescale.
+#
+# Everything below is copied from template.flink-ci.yml (compile job + test job
+# for module "tests") and nightly.yml (the java17 caller), so the container,
+# JDK, Maven profile, fork counts, randomization and watchdog all match the run
+# that failed. The ONLY additions are the shard matrix and the log capture.
+#
+# Do not reduce this to a single test class. An earlier version of this comment
+# claimed "reuseForks=false gives every ITCase class a fresh JVM" - that is
+# wrong. pom.xml sets flink.reuseForks=true, so a surefire fork is REUSED across
+# test classes and direct memory accumulates across all of them.
+#
+# Evidence from the artifact of the failing nightly (run 40052503223, mvn-4.log):
+# the OOM struck 637 ms into the 79th shouldRescaleUnalignedCheckpoint case, on a
+# JVM already holding 1610596643 of 1610612736 bytes. The limit is -Xmx1536m
+# (flink.XmxITCase) with no explicit -XX:MaxDirectMemorySize, so the JVM defaults
+# the direct ceiling to Xmx. The failing allocation was not a Flink network
+# buffer but Netty's 16 KB epoll IovArray - the first small request to find the
+# ceiling full, not the thing that filled it.
+#
+# THIS IS THE STRESS VARIANT. It keeps the churn and the exact failing ceiling
+# and removes only the two things that normally rescue the run:
+#
+#   1. natural GC. The heap is raised (flink.XmxITCase) so the JVM feels even
+#      less heap pressure and collects even less often, while
+#      -XX:MaxDirectMemorySize pins the direct ceiling at the original
+#      1610612736 bytes. Same ceiling, far less collection.
+#   2. the last-ditch System.gc() that java.nio.Bits.reserveMemory performs
+#      before throwing. -XX:+DisableExplicitGC makes it a no-op, so the OOM
+#      fires as soon as the ceiling is actually reached.
+#
+# Measured churn is ~44 MB/s and comes from UnalignedCheckpointRescaleITCase
+# itself (at 03:15 the failing nightly allocated 100 x 32 MB pools per minute,
+# all from this class), so scope=class sustains the same rate and fills
+# 1536 MB in roughly 35 s. That makes class scope viable HERE - unlike the
+# faithful variant, which needs module scope - and ~8 min per run instead of 45.
+---
+name: "FLINK-41248 STRESS: force the release-1.20 direct-memory OOM"
+
+on:
+  workflow_dispatch:
+    inputs:
+      scope:
+        description: "class = only UnalignedCheckpointRescaleITCase (~8 min/run). This class alone produces the ~44 MB/s churn, so under stress flags it is enough. module = the whole 'tests' module as the nightly did (~45 min/run)."
+        default: "class"
+        type: choice
+        options: ["class", "module"]
+      jobs_count:
+        description: "Number of parallel jobs."
+        default: "4"
+        type: string
+      iterations_per_job:
+        description: "Runs per job. Only applies to scope=class; module scope is always 1 run per job."
+        default: "3"
+        type: string
+      itcase_xmx:
+        description: "Value for flink.XmxITCase, i.e. -Xmx on the ITCase forks. Raising it above the original 1536m suppresses natural GC while max_direct_memory keeps the direct ceiling where it was. Single token, no spaces."
+        default: "4g"
+        type: string
+      stress_flags:
+        description: "Extra JVM flags appended to flink.surefire.baseArgLine in pom.xml. Default pins the direct ceiling at the original 1610612736 bytes and disables the System.gc() rescue inside Bits.reserveMemory. Set to the empty string to run with no stress at all."
+        default: "-XX:MaxDirectMemorySize=1536m -XX:+DisableExplicitGC"
+        type: string
+
+permissions: read-all
+
+env:
+  MOUNTED_WORKING_DIR: /__w/flink/flink
+  CONTAINER_LOCAL_WORKING_DIR: /root/flink
+  FLINK_ARTIFACT_DIR: /root/artifact-directory
+  FLINK_ARTIFACT_FILENAME: flink_artifacts.tar.gz
+  MAVEN_REPO_FOLDER: /root/.m2/repository
+  MAVEN_ARGS: -Dmaven.repo.local=/root/.m2/repository
+  DOCKER_IMAGES_CACHE_FOLDER: /root/.docker-cache
+  # from nightly.yml, job "java17"
+  FLINK_ENVIRONMENT: 'PROFILE="-Dinclude_hadoop_aws -Djdk11 -Djdk17 -Pjava17-target"'
+  FLINK_JDK_VERSION: 17
+
+jobs:
+  prepare:
+    name: "Prepare run list"
+    runs-on: ubuntu-22.04
+    outputs:
+      run-list: ${{ steps.gen.outputs.list }}
+    steps:
+      - name: "Generate run list"
+        id: gen
+        run: |
+          echo "list=$(seq 1 ${{ inputs.jobs_count }} | jq -R . | jq -cs .)" >> "$GITHUB_OUTPUT"
+
+  compile:
+    name: "Compile"
+    runs-on: ubuntu-22.04
+    container:
+      image: apache/flink-ci-docker:java_8_11_17_21_25_maven_386_3916_noble
+      options: --init --privileged
+    env:
+      GHA_JOB_TIMEOUT: 240
+    steps:
+      - name: "Flink Checkout"
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: "Initialize job"
+        uses: "./.github/actions/job_init"
+        with:
+          jdk_version: ${{ env.FLINK_JDK_VERSION }}
+          maven_repo_folder: ${{ env.MAVEN_REPO_FOLDER }}
+          source_directory: ${{ env.MOUNTED_WORKING_DIR }}
+          target_directory: ${{ env.CONTAINER_LOCAL_WORKING_DIR }}
+
+      - name: "Compile Flink"
+        uses: "./.github/actions/run_mvn"
+        timeout-minutes: 240
+        with:
+          working_directory: ${{ env.CONTAINER_LOCAL_WORKING_DIR }}
+          maven-parameters: "-T 1C test-compile -Dflink.markBundledAsOptional=false -Dfast"
+          env: "${{ env.FLINK_ENVIRONMENT }}"
+
+      - name: "Collect build artifacts"
+        working-directory: ${{ env.CONTAINER_LOCAL_WORKING_DIR }}
+        run: ./tools/azure-pipelines/create_build_artifact.sh
+
+      - name: "Upload artifacts to make them available in downstream jobs"
+        uses: actions/upload-artifact@v7
+        with:
+          name: repro-build-artifacts-${{ github.run_number }}
+          path: ${{ env.FLINK_ARTIFACT_DIR }}/${{ env.FLINK_ARTIFACT_FILENAME }}
+          if-no-files-found: error
+          retention-days: 1
+
+  test:
+    name: "Run ${{ matrix.run }} - Test (module: tests)"
+    needs: [prepare, compile]
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        run: ${{ fromJSON(needs.prepare.outputs.run-list) }}
+    container:
+      image: apache/flink-ci-docker:java_8_11_17_21_25_maven_386_3916_noble
+      options: --init --privileged
+      # the /mnt folder is a separate disk mounted to the host filesystem with
+      # more free disk space that can be utilized
+      volumes:
+        - /mnt:/root
+    env:
+      GHA_JOB_TIMEOUT: 240
+    steps:
+      - name: "Flink Checkout"
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: "Initialize job"
+        uses: "./.github/actions/job_init"
+        with:
+          jdk_version: ${{ env.FLINK_JDK_VERSION }}
+          maven_repo_folder: ${{ env.MAVEN_REPO_FOLDER }}
+          source_directory: ${{ env.MOUNTED_WORKING_DIR }}
+          target_directory: ${{ env.CONTAINER_LOCAL_WORKING_DIR }}
+
+      - name: "Set coredump pattern"
+        working-directory: ${{ env.CONTAINER_LOCAL_WORKING_DIR }}
+        run: sudo sysctl -w kernel.core_pattern=core.%p
+
+      - name: "Download build artifacts from compile job"
+        uses: actions/download-artifact@v8
+        with:
+          name: repro-build-artifacts-${{ github.run_number }}
+          path: ${{ env.FLINK_ARTIFACT_DIR }}
+
+      - name: "Unpack build artifact"
+        working-directory: ${{ env.CONTAINER_LOCAL_WORKING_DIR }}
+        run: ./tools/azure-pipelines/unpack_build_artifact.sh
+
+      - name: "Try loading Docker images from Cache"
+        id: docker-cache
+        uses: actions/cache@v6
+        with:
+          path: ${{ env.DOCKER_IMAGES_CACHE_FOLDER }}
+          key: tests-docker-${{ runner.os }}-${{ hashFiles('**/cache_docker_images.sh', '**/flink-test-utils-parent/**/DockerImageVersions.java') }}
+
+      - name: "Load Docker images if not present in cache, yet"
+        if: ${{ !cancelled() && !steps.docker-cache.outputs.cache-hit }}
+        working-directory: ${{ env.CONTAINER_LOCAL_WORKING_DIR }}
+        run: ./tools/azure-pipelines/cache_docker_images.sh load
+
+      # Apply the stress flags by editing pom.xml rather than going through
+      # MAVEN_ARGS. maven-utils.sh runs "$MAVEN_WRAPPER $MVN_GLOBAL_OPTIONS
+      # "${@}"" with $MVN_GLOBAL_OPTIONS UNQUOTED, so the shell word-splits it
+      # and a -D property whose value contains spaces can never survive. An
+      # earlier attempt to pass the argLine that way died with "Unrecognized
+      # option: --add-opens". flink.XmxITCase is a single token, so that one is
+      # safe to pass as -D.
+      - name: "Apply stress JVM flags"
+        if: ${{ inputs.stress_flags != '' || inputs.itcase_xmx != '' }}
+        working-directory: ${{ env.CONTAINER_LOCAL_WORKING_DIR }}
+        shell: bash
+        env:
+          STRESS_FLAGS: ${{ inputs.stress_flags }}
+          ITCASE_XMX: ${{ inputs.itcase_xmx }}
+        run: |
+          set -o errexit
+          if [ -n "$STRESS_FLAGS" ]; then
+            python3 - "$STRESS_FLAGS" <<'PY'
+          import re, sys
+          flags = sys.argv[1]
+          p = "pom.xml"
+          s = open(p).read()
+          tag = "<flink.surefire.baseArgLine>"
+          assert s.count(tag) == 1, "expected exactly one %s" % tag
+          s = s.replace(tag, tag + flags + " ", 1)
+          open(p, "w").write(s)
+          PY
+          fi
+          echo "--- effective ITCase JVM settings ---"
+          grep -n "flink.surefire.baseArgLine>" pom.xml
+          grep -n "<flink.XmxITCase>" pom.xml
+          if [ -n "$ITCASE_XMX" ]; then
+            echo "MAVEN_ARGS=-Dmaven.repo.local=/root/.m2/repository -Dflink.XmxITCase=$ITCASE_XMX" >> "$GITHUB_ENV"
+            echo "flink.XmxITCase will be overridden to $ITCASE_XMX via -D (single token, safe)"
+          fi
+
+      # ---------------- scope: module (byte-identical to the nightly) --------
+      - name: "Test - tests"
+        id: test-run
+        if: ${{ inputs.scope == 'module' }}
+        working-directory: ${{ env.CONTAINER_LOCAL_WORKING_DIR }}
+        env:
+          IT_CASE_S3_BUCKET: ${{ secrets.IT_CASE_S3_BUCKET }}
+          IT_CASE_S3_ACCESS_KEY: ${{ secrets.IT_CASE_S3_ACCESS_KEY }}
+          IT_CASE_S3_SECRET_KEY: ${{ secrets.IT_CASE_S3_SECRET_KEY }}
+        timeout-minutes: 240
+        run: |
+          ${{ env.FLINK_ENVIRONMENT }} PROFILE="$PROFILE -Pgithub-actions" ./tools/azure-pipelines/uploading_watchdog.sh \
+              ./tools/ci/test_controller.sh tests
+
+      # ---------------- scope: class ----------------------------------------
+      # reuseForks=false gives every ITCase class its own JVM, so running this
+      # class alone reproduces the same per-process direct-memory conditions.
+      # Maven flags below are the ones test_controller.sh uses for the "tests"
+      # stage; argLine is deliberately NOT overridden so -Xmx1536m and the
+      # implicit MaxDirectMemorySize stay exactly as they were.
+      - name: "Install flink-tests dependencies"
+        if: ${{ inputs.scope == 'class' }}
+        uses: "./.github/actions/run_mvn"
+        timeout-minutes: 120
+        with:
+          working_directory: ${{ env.CONTAINER_LOCAL_WORKING_DIR }}
+          maven-parameters: "-Dfast -Pskip-webui-build -DskipTests -pl flink-tests -am install"
+          env: "${{ env.FLINK_ENVIRONMENT }}"
+
+      - name: "Test - UnalignedCheckpointRescaleITCase"
+        id: class-run
+        if: ${{ inputs.scope == 'class' }}
+        working-directory: ${{ env.CONTAINER_LOCAL_WORKING_DIR }}
+        timeout-minutes: 330
+        # the container's default shell is dash; this script needs bash
+        shell: bash
+        env:
+          ITERATIONS: ${{ inputs.iterations_per_job }}
+        run: |
+          # GitHub runs "shell: bash" as "bash -e", and maven-utils.sh probes the
+          # Alibaba mirror with "curl | grep" at source time. That grep exits
+          # non-zero whenever the mirror is unreachable, which aborts the whole
+          # step before a single iteration. The official run_mvn action disables
+          # errexit for the same reason. The loop below also needs it off so it
+          # can read $? from each run and keep going after a failing iteration.
+          set +o errexit
+          # No "set -u" either: run_mvn in maven-utils.sh reads $MVN_RUN_VERBOSE
+          # (and $MVN_GLOBAL_OPTIONS, $MAVEN_MIRROR_CONFIG_FILE) without a
+          # default, so nounset kills the first iteration with "MVN_RUN_VERBOSE:
+          # unbound variable". The official run_mvn action does not set it.
+          set -o pipefail
+          ${{ env.FLINK_ENVIRONMENT }}
+          source ./tools/ci/maven-utils.sh
+
+          OUT_DIR=/root/repro-logs
+          mkdir -p "$OUT_DIR"
+          echo "log-dir=$OUT_DIR" >> "$GITHUB_OUTPUT"
+
+          REPRODUCED=0
+          for i in $(seq 1 "$ITERATIONS"); do
+            RUN_DIR="$OUT_DIR/job-${{ matrix.run }}-iteration-${i}"
+            mkdir -p "$RUN_DIR"
+            echo "::group::job ${{ matrix.run }} iteration ${i}/${ITERATIONS}"
+            START=$(date +%s)
+
+            run_mvn -Dfast -Pskip-webui-build \
+              -Dlog.dir="$RUN_DIR" \
+              -Dlog4j.configurationFile="file://$(pwd)/tools/ci/log4j.properties" \
+              -Dflink.tests.with-openssl \
+              -Dflink.tests.check-segment-multiple-free \
+              -Darchunit.freeze.store.default.allowStoreUpdate=false \
+              -Dpekko.rpc.force-invocation-serialization \
+              $PROFILE -Pgithub-actions \
+              -Dtest=UnalignedCheckpointRescaleITCase \
+              -Dsurefire.failIfNoSpecifiedTests=false \
+              -DfailIfNoTests=false \
+              -pl flink-tests verify
+            CODE=$?
+
+            echo "::endgroup::"
+            echo "job ${{ matrix.run }} iteration ${i}: exit=${CODE} duration=$(( $(date +%s) - START ))s"
+
+            if grep -rqs "direct buffer memory" "$RUN_DIR"; then
+              REPRODUCED=$((REPRODUCED + 1))
+              echo "::warning title=Reproduced::Direct-memory OOM on job ${{ matrix.run }} iteration ${i}"
+              grep -rhos "Cannot reserve [0-9]* bytes of direct buffer memory (allocated: [0-9]*, limit: [0-9]*)" "$RUN_DIR" | sort -u
+            fi
+
+            if [ "$CODE" -ne 0 ]; then
+              cp -r flink-tests/target/surefire-reports "$RUN_DIR/surefire-reports" 2>/dev/null || true
+            else
+              # keep failing iterations only; passing runs produce ~100 MB of logs each
+              rm -rf "$RUN_DIR"
+            fi
+          done
+
+          echo "=========================================================="
+          echo "job ${{ matrix.run }}: OOM reproduced in ${REPRODUCED}/${ITERATIONS} runs"
+          echo "=========================================================="
+          echo "reproduced=$REPRODUCED" >> "$GITHUB_OUTPUT"
+
+      # ---------------- shared reporting ------------------------------------
+      - name: "Check for the direct-memory OOM (module scope)"
+        if: ${{ always() && inputs.scope == 'module' && steps.test-run.outputs.debug-files-output-dir != '' }}
+        shell: bash
+        run: |
+          DIR="${{ steps.test-run.outputs.debug-files-output-dir }}"
+          if grep -rqs "direct buffer memory" "$DIR"; then
+            echo "::warning title=Reproduced::Direct-memory OOM hit on run ${{ matrix.run }}"
+            grep -rhos "Cannot reserve [0-9]* bytes of direct buffer memory (allocated: [0-9]*, limit: [0-9]*)" "$DIR" | sort -u
+            grep -rhos "UnalignedCheckpointRescaleITCase.shouldRescaleUnalignedCheckpoint\[[^]]*\]" "$DIR" | sort -u | head -5
+          else
+            echo "No direct-memory OOM in run ${{ matrix.run }}."
+          fi
+
+
+      - name: "Post-process build artifacts"
+        if: ${{ failure() && steps.test-run.outputs.debug-files-output-dir != '' }}
+        run: find ${{ steps.test-run.outputs.debug-files-output-dir }} -type f -exec rename 's/[:<>|*?]/-/' {} \;
+
+      - name: "Upload build artifacts (module scope)"
+        uses: actions/upload-artifact@v7
+        if: ${{ failure() && steps.test-run.outputs.debug-files-output-dir != '' }}
+        with:
+          name: logs-run-${{ matrix.run }}-${{ github.run_number }}-${{ steps.test-run.outputs.debug-files-name }}
+          path: ${{ steps.test-run.outputs.debug-files-output-dir }}
+          retention-days: 7
+
+      - name: "Upload logs from failing iterations (class scope)"
+        uses: actions/upload-artifact@v7
+        if: ${{ always() && inputs.scope == 'class' }}
+        with:
+          name: logs-class-job-${{ matrix.run }}-${{ github.run_number }}
+          path: /root/repro-logs
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: "Save Docker images to cache"
+        if: ${{ !cancelled() && !steps.docker-cache.outputs.cache-hit }}
+        working-directory: ${{ env.CONTAINER_LOCAL_WORKING_DIR }}
+        run: ./tools/azure-pipelines/cache_docker_images.sh save
